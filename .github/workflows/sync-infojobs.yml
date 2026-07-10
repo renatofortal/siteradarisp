@@ -10,7 +10,7 @@ on:
 jobs:
   sync:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -20,9 +20,18 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Restore logo cache
+        uses: actions/cache@v4
+        with:
+          path: logo_cache.json
+          key: infojobs-logo-cache-${{ github.run_id }}
+          restore-keys: |
+            infojobs-logo-cache-
+
       - name: Sync InfoJobs
         env:
           RADARISP_WP_URL: https://radarisp.com.br
           RADARISP_SYNC_KEY: ${{ secrets.RADARISP_SYNC_KEY }}
           INFOJOBS_MAX_PAGES: "20"
+          INFOJOBS_LOGO_FETCH_LIMIT: "200"
         run: python sync_infojobs.py

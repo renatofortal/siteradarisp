@@ -25,7 +25,7 @@ MAX_PAGES = int(os.environ.get("INFOJOBS_MAX_PAGES", "20"))
 WP_URL = os.environ.get("RADARISP_WP_URL", "https://radarisp.com.br").rstrip("/")
 SYNC_KEY = os.environ.get("RADARISP_SYNC_KEY", "")
 LOGO_CACHE = Path(__file__).with_name("logo_cache.json")
-LOGO_FETCH_LIMIT = int(os.environ.get("INFOJOBS_LOGO_FETCH_LIMIT", "60"))
+LOGO_FETCH_LIMIT = int(os.environ.get("INFOJOBS_LOGO_FETCH_LIMIT", "200"))
 
 ALLOW_RE = re.compile(
     r"fibra|telecom|telecomunica|provedor|\bisp\b|ftth|olt|onu|noc|rede[s]?|roteador|switch|"
@@ -38,6 +38,10 @@ ALLOW_RE = re.compile(
 )
 DENY_RE = re.compile(
     r"\b(garcom|garçom|cozinheir|bab[aá]|diarista|pedreiro|cabeleireir|manicure|motoboy de comida)\b",
+    re.I,
+)
+COMPANY_HREF_RE = re.compile(
+    r'href="(https://www\.infojobs\.com\.br/empresa-[^"]+)"',
     re.I,
 )
 
@@ -115,13 +119,15 @@ def parse_cards(fragment: str):
         if not title:
             continue
         company = "Empresa Confidencial"
+        company_url = ""
         cm = re.search(
-            r'href="https://www\.infojobs\.com\.br/empresa-[^"]+"[^>]*>\s*(.*?)\s*</a>',
+            r'href="(https://www\.infojobs\.com\.br/empresa-[^"]+)"[^>]*>\s*(.*?)\s*</a>',
             card,
             re.S,
         )
         if cm:
-            cand = re.sub(r"Este selo indica.*$", "", strip_html(cm.group(1))).strip()
+            company_url = cm.group(1)
+            cand = re.sub(r"Este selo indica.*$", "", strip_html(cm.group(2))).strip()
             if cand:
                 company = cand
         city, state = "", ""
@@ -139,6 +145,7 @@ def parse_cards(fragment: str):
                 "id": job_id,
                 "title": title,
                 "companyName": company,
+                "companyUrl": company_url,
                 "city": city,
                 "state": state,
                 "workplaceLabel": workplace_from_card(card),
@@ -189,55 +196,116 @@ def save_logo_cache(cache: dict):
     LOGO_CACHE.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def is_valid_logo(url: str) -> bool:
+    if not url or not url.startswith("http"):
+        return False
+    u = url.lower()
+    bad = (
+        "placeholder",
+        "og-image.png",
+        "logo-duotone",
+        "none.gif",
+        "/mail/images/",
+        "favicon",
+        "mf-publicarea/images/common/",
+        "app_theme/images/logo",
+        "awards-footer",
+    )
+    if any(b in u for b in bad):
+        return False
+    # Prefer InfoJobs CDN company logos; reject other generic InfoJobs assets.
+    if "infojobs.com.br" in u and "/logos/" not in u:
+        return False
+    return True
+
+
 def extract_logo_from_html(html: str) -> str:
     patterns = [
+        r'property="og:image:secure_url"\s+content="([^"]+)"',
+        r'content="([^"]+)"\s+property="og:image:secure_url"',
         r'property="og:image"\s+content="([^"]+)"',
         r'content="([^"]+)"\s+property="og:image"',
         r'<meta[^>]+name="twitter:image"[^>]+content="([^"]+)"',
-        r'class="[^"]*company[^"]*logo[^"]*"[^>]*src="([^"]+)"',
-        r'<img[^>]+src="(https://[^"]+(?:logo|Logo)[^"]*)"',
+        r'<img[^>]+alt="[^"]*logo[^"]*"[^>]+src="([^"]+)"',
+        r'<img[^>]+src="(https://ncdn\d*\.infojobs\.com\.br/logos/[^"]+)"',
+        r'<img[^>]+src="(https://[^"]+/logos/[^"]+)"',
     ]
     for pat in patterns:
-        m = re.search(pat, html, re.I)
-        if m:
+        for m in re.finditer(pat, html, re.I):
             url = m.group(1).strip()
             if url.startswith("//"):
                 url = "https:" + url
-            if url.startswith("http") and "placeholder" not in url.lower():
+            # Prefer full logo over tiny _t thumbnails when both exist.
+            url = re.sub(r"(_t)(\.(?:jpg|jpeg|png|webp))(?:\?.*)?$", r"\2", url, flags=re.I)
+            if is_valid_logo(url):
                 return url
     return ""
+
+
+def company_url_from_html(html: str) -> str:
+    m = COMPANY_HREF_RE.search(html or "")
+    return m.group(1) if m else ""
 
 
 def enrich_logos(jobs: list):
     cache = load_logo_cache()
     fetched = 0
+    applied = 0
     for job in jobs:
         company = (job.get("companyName") or "").strip()
         if not company or company.lower() == "empresa confidencial":
             continue
         key = company.lower()
-        if key in cache and cache[key]:
-            job["logo"] = cache[key]
+        if key in cache:
+            if cache[key]:
+                job["logo"] = cache[key]
+                applied += 1
             continue
         if fetched >= LOGO_FETCH_LIMIT:
             continue
-        url = job.get("applyUrl") or ""
-        if not url:
-            continue
+
+        company_url = (job.get("companyUrl") or "").strip()
         try:
-            html = fetch(url)
-            logo = extract_logo_from_html(html)
+            if not company_url:
+                apply_url = job.get("applyUrl") or ""
+                if not apply_url:
+                    cache[key] = ""
+                    continue
+                vac_html = fetch(apply_url)
+                fetched += 1
+                company_url = company_url_from_html(vac_html)
+                time.sleep(0.2)
+                if not company_url:
+                    cache[key] = ""
+                    continue
+
+            html = fetch(company_url)
             fetched += 1
+            logo = extract_logo_from_html(html)
             if logo:
                 cache[key] = logo
                 job["logo"] = logo
-                print("logo", company, logo[:80])
+                applied += 1
+                print("logo", company, logo[:100])
+            else:
+                cache[key] = ""
+                print("logo miss", company, company_url)
             time.sleep(0.25)
         except Exception as e:
             print("logo err", company, e)
             fetched += 1
+            # Don't poison cache on transient errors.
     save_logo_cache(cache)
-    print("logos fetched this run", fetched, "cache size", len(cache))
+    print(
+        "logos fetched this run",
+        fetched,
+        "applied",
+        applied,
+        "cache size",
+        len(cache),
+        "with logo",
+        sum(1 for v in cache.values() if v),
+    )
 
 
 def post_to_wordpress(jobs):
@@ -252,7 +320,7 @@ def post_to_wordpress(jobs):
         headers={
             "Content-Type": "application/json; charset=utf-8",
             "X-RadarISP-Sync-Key": SYNC_KEY,
-            "User-Agent": "RadarISP-InfoJobs-Sync/1.1",
+            "User-Agent": "RadarISP-InfoJobs-Sync/1.2",
         },
     )
     try:
