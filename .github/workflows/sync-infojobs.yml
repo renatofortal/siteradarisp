@@ -2,8 +2,9 @@ name: Sync InfoJobs → RadarISP
 
 on:
   schedule:
-    # Todos os dias às 06:00 UTC (03:00 horário de Brasília)
-    - cron: "0 6 * * *"
+    # 10:00 e 15:00 horário de Brasília (UTC-3)
+    - cron: "0 13 * * *"
+    - cron: "0 18 * * *"
   workflow_dispatch:
 
 jobs:
