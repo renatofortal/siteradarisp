@@ -308,10 +308,18 @@ def enrich_logos(jobs: list):
     )
 
 
-def post_to_wordpress(jobs):
+def post_to_wordpress(jobs, finalize=True, keep_job_ids=None):
     if not SYNC_KEY:
         raise SystemExit("RADARISP_SYNC_KEY missing")
-    payload = json.dumps({"source": "infojobs", "count": len(jobs), "jobs": jobs}, ensure_ascii=False).encode("utf-8")
+    payload_obj = {
+        "source": "infojobs",
+        "count": len(jobs),
+        "jobs": jobs,
+        "finalize": bool(finalize),
+    }
+    if keep_job_ids is not None:
+        payload_obj["keep_job_ids"] = list(keep_job_ids)
+    payload = json.dumps(payload_obj, ensure_ascii=False).encode("utf-8")
     url = WP_URL + "/wp-json/radarisp/v1/infojobs-import"
     req = urllib.request.Request(
         url,
@@ -320,17 +328,61 @@ def post_to_wordpress(jobs):
         headers={
             "Content-Type": "application/json; charset=utf-8",
             "X-RadarISP-Sync-Key": SYNC_KEY,
-            "User-Agent": "RadarISP-InfoJobs-Sync/1.2",
+            "User-Agent": "RadarISP-InfoJobs-Sync/1.3",
         },
     )
     try:
-        with urllib.request.urlopen(req, timeout=180) as r:
+        with urllib.request.urlopen(req, timeout=300) as r:
             body = r.read().decode("utf-8", "replace")
-            print("WP", r.status, body[:500])
+            print("WP", r.status, "finalize", finalize, "jobs", len(jobs), body[:500])
             return json.loads(body)
     except urllib.error.HTTPError as e:
         print("WP ERROR", e.code, e.read().decode("utf-8", "replace")[:800])
         raise
+    except Exception as e:
+        # Proxy/host timeout after PHP already saved is common on large imports.
+        print("WP TRANSPORT", type(e).__name__, e)
+        raise
+
+
+def post_jobs_chunked(jobs, chunk_size=120):
+    if not jobs:
+        raise SystemExit("No jobs to post")
+    keep_ids = [j["id"] for j in jobs]
+    results = []
+    total = len(jobs)
+    for i in range(0, total, chunk_size):
+        chunk = jobs[i : i + chunk_size]
+        is_last = (i + chunk_size) >= total
+        print(
+            "posting chunk",
+            (i // chunk_size) + 1,
+            "size",
+            len(chunk),
+            "finalize",
+            is_last,
+        )
+        last_err = None
+        for attempt in range(1, 3):
+            try:
+                results.append(
+                    post_to_wordpress(
+                        chunk,
+                        finalize=is_last,
+                        keep_job_ids=keep_ids if is_last else None,
+                    )
+                )
+                last_err = None
+                break
+            except Exception as e:
+                last_err = e
+                print("chunk attempt", attempt, "failed:", type(e).__name__, e)
+                if attempt < 2:
+                    time.sleep(3)
+        if last_err is not None:
+            raise last_err
+        time.sleep(0.4)
+    return results[-1] if results else {}
 
 
 def main():
@@ -342,8 +394,10 @@ def main():
     print("unique jobs", len(jobs))
     filtered = [j for j in jobs if is_relevant(j)]
     print("after quality filter", len(filtered), "dropped", len(jobs) - len(filtered))
+    if not filtered:
+        raise SystemExit("No relevant InfoJobs vacancies fetched")
     enrich_logos(filtered)
-    result = post_to_wordpress(filtered)
+    result = post_jobs_chunked(filtered)
     print("done", result)
 
 
