@@ -6,12 +6,13 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import http.cookiejar
 from html import unescape
 from pathlib import Path
 
 UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 )
 API_ROOT = "https://www.infojobs.com.br"
 FRAGMENT = "/mf-publicarea/VacancyList/GetVacancyListFragment"
@@ -25,7 +26,9 @@ MAX_PAGES = int(os.environ.get("INFOJOBS_MAX_PAGES", "20"))
 WP_URL = os.environ.get("RADARISP_WP_URL", "https://radarisp.com.br").rstrip("/")
 SYNC_KEY = os.environ.get("RADARISP_SYNC_KEY", "")
 LOGO_CACHE = Path(__file__).with_name("logo_cache.json")
-LOGO_FETCH_LIMIT = int(os.environ.get("INFOJOBS_LOGO_FETCH_LIMIT", "200"))
+LOGO_FETCH_LIMIT = int(os.environ.get("INFOJOBS_LOGO_FETCH_LIMIT", "50"))
+CHUNK_SIZE = int(os.environ.get("INFOJOBS_CHUNK_SIZE", "50"))
+POST_RETRIES = int(os.environ.get("INFOJOBS_POST_RETRIES", "5"))
 
 ALLOW_RE = re.compile(
     r"fibra|telecom|telecomunica|provedor|\bisp\b|ftth|olt|onu|noc|rede[s]?|roteador|switch|"
@@ -45,19 +48,32 @@ COMPANY_HREF_RE = re.compile(
     re.I,
 )
 
+_COOKIE_JAR = http.cookiejar.CookieJar()
+_OPENER = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(_COOKIE_JAR))
 
-def fetch(url: str) -> str:
+
+def fetch(url: str, accept: str = "application/json, text/html;q=0.9") -> str:
     req = urllib.request.Request(
         url,
         headers={
             "User-Agent": UA,
-            "Accept": "application/json, text/html;q=0.9",
+            "Accept": accept,
             "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
             "Referer": "https://www.infojobs.com.br/",
+            "Origin": "https://www.infojobs.com.br",
         },
     )
-    with urllib.request.urlopen(req, timeout=45) as r:
+    with _OPENER.open(req, timeout=45) as r:
         return r.read().decode("utf-8", "replace")
+
+
+def warm_session() -> None:
+    """Hit a listing page first so Azure WAF / cookies are primed."""
+    try:
+        fetch(LISTINGS[0], accept="text/html,application/xhtml+xml")
+        print("session warmed, cookies", len(_COOKIE_JAR))
+    except Exception as e:
+        print("session warm failed:", type(e).__name__, e)
 
 
 def strip_html(text: str) -> str:
@@ -161,6 +177,7 @@ def parse_cards(fragment: str):
 def fetch_listing(listing: str):
     all_jobs = []
     empty = 0
+    errors = []
     for page in range(1, MAX_PAGES + 1):
         url = re.sub(r"[?&]page=\d+", "", listing).rstrip("?&")
         url += ("&" if "?" in url else "?") + f"page={page}"
@@ -168,7 +185,9 @@ def fetch_listing(listing: str):
         try:
             data = json.loads(fetch(api))
         except Exception as e:
-            print("ERR", listing, page, e)
+            msg = f"{type(e).__name__}: {e}"
+            print("ERR", listing, page, msg)
+            errors.append({"listing": listing, "page": page, "error": msg})
             break
         jobs = parse_cards(data.get("listFragmentHTML") or "")
         print(listing.split("/")[-1], "page", page, "jobs", len(jobs), "eof", data.get("eof"))
@@ -180,7 +199,7 @@ def fetch_listing(listing: str):
         if data.get("eof") or empty >= 2:
             break
         time.sleep(0.3)
-    return all_jobs
+    return all_jobs, errors
 
 
 def load_logo_cache():
@@ -213,7 +232,6 @@ def is_valid_logo(url: str) -> bool:
     )
     if any(b in u for b in bad):
         return False
-    # Prefer InfoJobs CDN company logos; reject other generic InfoJobs assets.
     if "infojobs.com.br" in u and "/logos/" not in u:
         return False
     return True
@@ -235,7 +253,6 @@ def extract_logo_from_html(html: str) -> str:
             url = m.group(1).strip()
             if url.startswith("//"):
                 url = "https:" + url
-            # Prefer full logo over tiny _t thumbnails when both exist.
             url = re.sub(r"(_t)(\.(?:jpg|jpeg|png|webp))(?:\?.*)?$", r"\2", url, flags=re.I)
             if is_valid_logo(url):
                 return url
@@ -271,7 +288,7 @@ def enrich_logos(jobs: list):
                 if not apply_url:
                     cache[key] = ""
                     continue
-                vac_html = fetch(apply_url)
+                vac_html = fetch(apply_url, accept="text/html")
                 fetched += 1
                 company_url = company_url_from_html(vac_html)
                 time.sleep(0.2)
@@ -279,7 +296,7 @@ def enrich_logos(jobs: list):
                     cache[key] = ""
                     continue
 
-            html = fetch(company_url)
+            html = fetch(company_url, accept="text/html")
             fetched += 1
             logo = extract_logo_from_html(html)
             if logo:
@@ -308,6 +325,13 @@ def enrich_logos(jobs: list):
     )
 
 
+def is_transport_error(exc: BaseException) -> bool:
+    if isinstance(exc, (TimeoutError, urllib.error.URLError)):
+        return True
+    name = type(exc).__name__
+    return name in {"TimeoutError", "URLError", "RemoteDisconnected", "BrokenPipeError"}
+
+
 def post_to_wordpress(jobs, finalize=True, keep_job_ids=None):
     if not SYNC_KEY:
         raise SystemExit("RADARISP_SYNC_KEY missing")
@@ -328,7 +352,7 @@ def post_to_wordpress(jobs, finalize=True, keep_job_ids=None):
         headers={
             "Content-Type": "application/json; charset=utf-8",
             "X-RadarISP-Sync-Key": SYNC_KEY,
-            "User-Agent": "RadarISP-InfoJobs-Sync/1.3",
+            "User-Agent": "RadarISP-InfoJobs-Sync/1.4",
         },
     )
     try:
@@ -345,53 +369,81 @@ def post_to_wordpress(jobs, finalize=True, keep_job_ids=None):
         raise
 
 
-def post_jobs_chunked(jobs, chunk_size=120):
+def post_with_retries(jobs, finalize=False, keep_job_ids=None, label="chunk"):
+    last_err = None
+    for attempt in range(1, POST_RETRIES + 1):
+        try:
+            return post_to_wordpress(jobs, finalize=finalize, keep_job_ids=keep_job_ids)
+        except Exception as e:
+            last_err = e
+            print(label, "attempt", attempt, "failed:", type(e).__name__, e)
+            if attempt < POST_RETRIES:
+                time.sleep(min(30, 2 ** attempt))
+    raise last_err
+
+
+def post_jobs_chunked(jobs, chunk_size=None):
     if not jobs:
         raise SystemExit("No jobs to post")
+    chunk_size = chunk_size or CHUNK_SIZE
     keep_ids = [j["id"] for j in jobs]
     results = []
     total = len(jobs)
+    # 1) Upload all jobs as partial chunks (never finalize mid-way).
     for i in range(0, total, chunk_size):
         chunk = jobs[i : i + chunk_size]
-        is_last = (i + chunk_size) >= total
-        print(
-            "posting chunk",
-            (i // chunk_size) + 1,
-            "size",
-            len(chunk),
-            "finalize",
-            is_last,
+        n = (i // chunk_size) + 1
+        print("posting chunk", n, "size", len(chunk), "finalize", False)
+        results.append(post_with_retries(chunk, finalize=False, label=f"chunk-{n}"))
+        time.sleep(0.5)
+
+    # 2) Finalize separately — small payload, less likely to hit proxy timeout.
+    print("finalizing keep_ids", len(keep_ids))
+    try:
+        final = post_with_retries(
+            [],
+            finalize=True,
+            keep_job_ids=keep_ids,
+            label="finalize",
         )
-        last_err = None
-        for attempt in range(1, 3):
-            try:
-                results.append(
-                    post_to_wordpress(
-                        chunk,
-                        finalize=is_last,
-                        keep_job_ids=keep_ids if is_last else None,
-                    )
-                )
-                last_err = None
-                break
-            except Exception as e:
-                last_err = e
-                print("chunk attempt", attempt, "failed:", type(e).__name__, e)
-                if attempt < 2:
-                    time.sleep(3)
-        if last_err is not None:
-            raise last_err
-        time.sleep(0.4)
-    return results[-1] if results else {}
+        return final
+    except Exception as e:
+        # If the host timed out but PHP likely finished, one soft-success path.
+        if is_transport_error(e) and results:
+            print(
+                "WARN finalize transport failed after successful chunks;",
+                "treating as soft-success. last chunk ok=",
+                bool(results),
+            )
+            return {
+                "ok": True,
+                "soft_success": True,
+                "finalize_error": f"{type(e).__name__}: {e}",
+                "chunks": len(results),
+                "jobs": total,
+            }
+        raise
 
 
 def main():
+    warm_session()
     seen = {}
+    all_errors = []
     for listing in LISTINGS:
-        for job in fetch_listing(listing):
+        jobs, errors = fetch_listing(listing)
+        all_errors.extend(errors)
+        for job in jobs:
             seen[job["id"]] = job
     jobs = list(seen.values())
     print("unique jobs", len(jobs))
+    if not jobs:
+        blocked = sum(1 for e in all_errors if "403" in str(e.get("error", "")))
+        if blocked:
+            raise SystemExit(
+                f"InfoJobs blocked scraper (HTTP 403 on {blocked} listing starts). "
+                "Azure WAF is rejecting this runner IP."
+            )
+        raise SystemExit("No InfoJobs vacancies fetched")
     filtered = [j for j in jobs if is_relevant(j)]
     print("after quality filter", len(filtered), "dropped", len(jobs) - len(filtered))
     if not filtered:

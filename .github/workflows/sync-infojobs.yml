@@ -33,5 +33,7 @@ jobs:
           RADARISP_WP_URL: https://radarisp.com.br
           RADARISP_SYNC_KEY: ${{ secrets.RADARISP_SYNC_KEY }}
           INFOJOBS_MAX_PAGES: "20"
-          INFOJOBS_LOGO_FETCH_LIMIT: "200"
+          INFOJOBS_LOGO_FETCH_LIMIT: "40"
+          INFOJOBS_CHUNK_SIZE: "50"
+          INFOJOBS_POST_RETRIES: "5"
         run: python sync_infojobs.py
